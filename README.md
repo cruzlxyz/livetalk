@@ -16,17 +16,18 @@ A composer mini-bar for the Hermes desktop app: a full-duplex voice session in o
 
 ---
 
-## Two voice providers
+## Three voice providers
 
-| | **Gemini Live** (Google) | **ElevenLabs Realtime** |
-|---|---|---|
-| Models | `gemini-3.8-live`, `gemini-2.5-flash-native-audio-latest`, `…-preview-12-2025`, `…-preview-09-2025`, `gemini-3.1-flash-live-preview` | `eleven_realtime_v1_mini`, `eleven_realtime_v1_max` |
-| Voices | 30 HD prebuilt (Puck, Aoede, Kore, Leda, …) | every voice on your account (17k+ library) |
-| Languages | any documented BCP-47 pair (primary + secondary) | auto-detected, 90+ languages incl. Indonesian & Javanese |
-| Transcript | streaming, word by word | streaming; expressive tags (`[calm]`, `[laughs]`) stripped so the text matches the speech |
-| Key | `GOOGLE_API_KEY` | `ELEVENLABS_API_KEY` |
+| | **Gemini Live** (Google) | **ElevenLabs Realtime** | **Grok Voice** (xAI) |
+|---|---|---|---|
+| Models | `gemini-3.8-live`, `gemini-2.5-flash-native-audio-latest`, `…-preview-12-2025`, `…-preview-09-2025`, `gemini-3.1-flash-live-preview` | `eleven_realtime_v1_mini`, `eleven_realtime_v1_max` | `grok-voice-3.0` (recommended), `grok-voice-2.0` |
+| Voices | 30 HD prebuilt (Puck, Aoede, Kore, Leda, …) | every voice on your account (17k+ library) | **28** multilingual built-ins (`eve` default, `ara`, `leo`, `luna`, …) + custom voice ids |
+| Languages | any documented BCP-47 pair (primary + secondary) | auto-detected, 90+ languages incl. Indonesian & Javanese | 20 BCP-47 codes, **`id` included**, plus `auto` |
+| Transcript | streaming, word by word | streaming; expressive tags (`[calm]`, `[laughs]`) stripped so the text matches the speech | streaming, no expressive tags — matches the speech as-is |
+| Key | `GOOGLE_API_KEY` | `ELEVENLABS_API_KEY` | `XAI_API_KEY` |
+| Extra | ephemeral single-use tokens, session resumption | OpenAI-realtime protocol, semantic VAD | session resumption, server VAD, native `web_search` / `x_search` / `mcp` tools |
 
-Pick the provider in **Settings → Plugins → livetalk**. Each provider keeps its own model/voice/language fields — switching never mixes them. Tools (`talk`, `recall`), barge-in, transcript and the token meter behave the same on both.
+Pick the provider in **Settings → Plugins → livetalk**. Each provider keeps its own model/voice/language fields — switching never mixes them. Tools (`talk`, `recall`), barge-in, transcript and the token meter behave the same on all three.
 
 ## What you get
 
@@ -46,7 +47,7 @@ Pick the provider in **Settings → Plugins → livetalk**. Each provider keeps 
 | | |
 |---|---|
 | **Hermes** | Desktop app with plugin support; **tested on v0.23.3** (`requires_hermes: >=0.22.0`). The settings page needs a build with `registerSettingsPage` (~0.23+). |
-| **API key** | One of: `GOOGLE_API_KEY` ([AI Studio](https://aistudio.google.com/apikey), Live API access) or `ELEVENLABS_API_KEY` ([elevenlabs.io](https://elevenlabs.io), Realtime Conversations) — in `~/.hermes/.env` |
+| **API key** | One per provider you use, in `~/.hermes/.env`: `GOOGLE_API_KEY` ([AI Studio](https://aistudio.google.com/apikey)), `ELEVENLABS_API_KEY` ([elevenlabs.io](https://elevenlabs.io)), `XAI_API_KEY` ([console.x.ai](https://console.x.ai)) |
 | **Python** | Nothing extra — the backend uses only Hermes-bundled packages (`fastapi`, `websockets`) |
 | **Hardware** | Microphone + speakers/headphones (headphones strongly recommended — see Tips) |
 | **OS** | Windows / macOS / Linux desktop |
@@ -64,6 +65,7 @@ This installs both halves (the Python dashboard backend and the desktop mini-bar
 ```
 GOOGLE_API_KEY=AIza...
 ELEVENLABS_API_KEY=sk_...
+XAI_API_KEY=xai-...
 ```
 
 Then click the blob in the status bar and just talk.
@@ -94,7 +96,7 @@ One page, provider-aware — only the active provider's fields are shown.
 
 | Setting | Scope | Values | Default |
 |---|---|---|---|
-| Provider | common | `gemini` / `elevenlabs` | `gemini` |
+| Provider | common | `gemini` / `elevenlabs` / `grok` | `gemini` |
 | Live model | Gemini | the five Live models above | `gemini-3.8-live` |
 | Voice | Gemini | 30 HD prebuilt voices | `Puck` |
 | Primary language | Gemini | any documented BCP-47 code | `id-ID` |
@@ -102,6 +104,9 @@ One page, provider-aware — only the active provider's fields are shown.
 | ElevenLabs model | ElevenLabs | `eleven_realtime_v1_mini` / `_max` | `_mini` |
 | ElevenLabs voice | ElevenLabs | every voice on your account | `brian` |
 | ElevenLabs language | ElevenLabs | `auto` or a fixed language | `auto` |
+| Grok model | Grok | `grok-voice-3.0` / `grok-voice-2.0` | `grok-voice-3.0` |
+| Grok voice | Grok | 28 built-in voices (`eve`, `ara`, `leo`, …) | `eve` |
+| Grok language | Grok | `auto` or a BCP-47 hint (20 codes, incl. `id`) | `auto` |
 | Smart transcription | common | on/off — removes fillers, fixes false starts | on |
 | Spoken answers | common | `full` / `brief` (2–4 sentences) | `full` |
 | Show transcript | common | show the popover conversation text | on |
@@ -149,13 +154,13 @@ Full details and diagrams: [docs/WORKFLOW.md](docs/WORKFLOW.md).
 │  Backend (plugin_api.py, FastAPI router)        │
 │  • owns the upstream WebSocket (either provider)│
 │  • Gemini: mints 1-use ephemeral tokens         │
-│  • ElevenLabs: mints a realtime client session  │
+│  • ElevenLabs / Grok: OpenAI realtime protocol  │
 │  • queues talk + recall calls                   │
 │  • reads/writes the plugin settings page        │
 └───────┬────────────────────────┬────────────────┘
         │ wss://…                │ prompt.submit / prompt.receipt
         ▼                        ▼
-  Gemini Live / ElevenLabs   Hermes agent session
+  Gemini Live / ElevenLabs / Grok   Hermes agent session
   Realtime (v1alpha)         "Livetalk" (full toolset)
 ```
 

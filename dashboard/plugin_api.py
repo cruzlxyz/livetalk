@@ -270,7 +270,10 @@ def _load_settings() -> dict:
         "show_transcript": st.get("show_transcript") not in (False, "false", "off"),
         "show_log": st.get("show_log") not in (False, "false", "off"),
         "voice": st.get("voice") if st.get("voice") in _VOICE_NAMES else "Puck",
-        "provider": st.get("provider") if st.get("provider") in ("gemini", "elevenlabs") else "gemini",
+        "provider": st.get("provider") if st.get("provider") in ("gemini", "elevenlabs", "grok") else "gemini",
+        "grok_model": st.get("grok_model") if st.get("grok_model") in ("grok-voice-3.0", "grok-voice-2.0") else "grok-voice-3.0",
+        "grok_voice": st.get("grok_voice") if st.get("grok_voice") in _GROK_VOICES else "eve",
+        "grok_language": st.get("grok_language") if st.get("grok_language") in (["auto"] + _GROK_LANGS) else "auto",
         "elevenlabs_model": st.get("elevenlabs_model") if st.get("elevenlabs_model") in ("eleven_realtime_v1_mini", "eleven_realtime_v1_max") else "eleven_realtime_v1_mini",
         "elevenlabs_voice": st.get("elevenlabs_voice") if isinstance(st.get("elevenlabs_voice"), str) and st.get("elevenlabs_voice") else "brian",
         "elevenlabs_language": st.get("elevenlabs_language") if st.get("elevenlabs_language") in (["auto"] + _ELEVEN_LANGS) else "auto",
@@ -420,9 +423,24 @@ _ELEVEN_LANGS = ("af,am,ar,as,ast,az,be,bg,bn,bs,ca,ceb,ckb,cs,cy,da,de,el,en,es
                  "ny,oc,or,pa,pl,ps,pt,ro,ru,sd,sk,sl,sn,so,sr,sv,sw,ta,te,tg,th,tr,uk,ur,uz,vi,wo,yo,yue,zh,zu").split(",")
 _ELEVEN_DEFAULT_VOICE = "nPczCjzI2devNBz1zQrb"   # premade "Brian — Deep, Resonant and Comforting"
 
+# Grok (xAI) — verified live against GET /v1/tts/voices with the account key.
+_GROK_VOICES = ["altair", "ara", "atlas", "aurora", "carina", "castor", "celeste", "cosmo", "eve",
+                "helios", "helix", "iris", "kepler", "leo", "liora", "lumen", "luna", "lux", "naksh",
+                "orion", "perseus", "rex", "rigel", "sal", "sirius", "ursa", "zagan", "zenith"]
+# xAI documents 20 BCP-47 codes; the realtime session takes the same codes as a
+# transcription language hint.
+_GROK_LANGS = ["en", "id", "ar-EG", "ar-SA", "ar-AE", "bn", "zh", "fr", "de", "hi", "it", "ja",
+               "ko", "pt-BR", "pt-PT", "ru", "es-MX", "es-ES", "tr", "vi"]
+
 _SETTINGS_SPEC = {
-    "provider": {"scope": "common", "type": "enum", "choices": ["gemini", "elevenlabs"], "default": "gemini",
+    "provider": {"scope": "common", "type": "enum", "choices": ["gemini", "elevenlabs", "grok"], "default": "gemini",
                  "label": "Provider", "description": "The voice provider for the live session."},
+    "grok_model": {"scope": "grok", "type": "enum", "choices": ["grok-voice-3.0", "grok-voice-2.0"], "default": "grok-voice-3.0",
+                   "label": "Grok model", "description": "grok-voice-3.0 is recommended by xAI; 2.0 is the previous generation."},
+    "grok_voice": {"scope": "grok", "type": "enum", "choices": _GROK_VOICES, "default": "eve",
+                   "label": "Grok voice", "description": "28 built-in multilingual voices (or a custom voice id from the xAI console)."},
+    "grok_language": {"scope": "grok", "type": "enum", "choices": ["auto"] + _GROK_LANGS, "default": "auto",
+                      "label": "Grok language", "description": "Transcription language hint (BCP-47). Auto works for most speech; pin it for short or accented turns."},
     "live_model": {"scope": "gemini", "type": "enum", "default": "gemini-3.8-live",
                    "choices": ["gemini-3.8-live", "gemini-2.5-flash-native-audio-latest", "gemini-2.5-flash-native-audio-preview-12-2025",
                                "gemini-2.5-flash-native-audio-preview-09-2025", "gemini-3.1-flash-live-preview"],
@@ -601,6 +619,133 @@ def _resample_16_to_24(pcm: bytes) -> bytes:
         b = src[j + 1] if j + 1 < n else a
         out[i] = int(a + (b - a) * (pos - j))
     return out.tobytes()
+
+
+XAI_HOST = "wss://api.x.ai/v1/realtime"
+
+
+def _xai_key() -> str:
+    return _env_value("XAI_API_KEY")
+
+
+async def _grok_reader(ws) -> None:
+    """Pump xAI realtime frames (OpenAI-compatible) into the state lists."""
+    try:
+        while True:
+            frame = await ws.recv()
+            if isinstance(frame, bytes):
+                frame = frame.decode("utf-8", "replace")
+            ev = json.loads(frame)
+            t = ev.get("type", "")
+            if t == "response.created":
+                _state["responding"] = True
+            elif t == "response.output_audio.delta":
+                d = ev.get("delta") or ""
+                if d:
+                    _state["audio"].append(d)
+            elif t == "response.output_audio_transcript.delta":
+                d = ev.get("delta") or ""
+                if d:
+                    _state["output"].append(d)
+            elif t == "response.output_audio_transcript.done":
+                if _state["output"] and _state["output"][-1] != "—":
+                    _state["output"].append("—")
+            elif t == "conversation.item.input_audio_transcription.completed":
+                txt = (ev.get("transcript") or "").strip()
+                if txt:
+                    _state["input"].append(txt)
+            elif t == "response.function_call_arguments.done":
+                name = ev.get("name", "")
+                args = {}
+                try:
+                    args = json.loads(ev.get("arguments") or "{}")
+                except Exception:  # noqa: BLE001
+                    args = {}
+                # xAI puts the usable id in `call_id`; `item.id` is a longer
+                # composite (…-call-<call_id>) that the API rejects.
+                call_id = ev.get("call_id") or ev.get("item", {}).get("call_id") or ""
+                if name == "recall":
+                    _state["recalls"].append({"id": call_id, "query": str(args.get("query", ""))[:200]})
+                elif call_id:
+                    _state["delegations"].append({"id": call_id,
+                                                  "request": str(args.get("request", ""))[:2000]})
+            elif t == "response.done":
+                _state["responding"] = False
+                if ev.get("response", {}).get("usage"):
+                    _state["usage"] = ev["response"]["usage"]
+                if _state["output"] and _state["output"][-1] != "—":
+                    _state["output"].append("—")
+            elif t == "input_audio_buffer.speech_started":
+                _state["interrupted"] += 1
+            elif t == "error":
+                err = ev.get("error") or {}
+                _state["error"] = str(err.get("message") or err)[:200]
+                break
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the reader reports the real state
+        _state["error"] = f"upstream closed: {exc}"[:200]
+    finally:
+        _state["session"] = None
+
+
+async def _start_grok(body: dict | None = None) -> dict:
+    import websockets
+    key = _xai_key()
+    if not key:
+        return {"ok": False, "error": "XAI_API_KEY not set in the environment or ~/.hermes/.env"}
+    s = _load_settings()
+    model = s["grok_model"]
+    voice = s["grok_voice"]
+    language = s["grok_language"]
+    transcription: dict = {}
+    if language and language != "auto":
+        transcription["language_hint"] = language
+    ctx_text = str((body or {}).get("session_context") or "").strip()[:6000]
+    await _cleanup()
+    _state.update({"session": None, "ws": None, "model": "", "provider": "", "input": [], "output": [], "audio": [],
+                   "error": "", "usage": None, "interaction": "", "delegations": [], "recalls": [],
+                   "tool_in_flight": None, "interrupted": 0, "resumed": False, "responding": False})
+    instructions = _persona_with_context(body)
+    if transcription:
+        instructions += chr(10) + "The user speaks in the language hinted by the transcription setting."
+    try:
+        ws = await websockets.connect(f"{XAI_HOST}?model={model}",
+                                      additional_headers={"Authorization": f"Bearer {key}"},
+                                      open_timeout=15, close_timeout=5)
+        await ws.send(json.dumps({"type": "session.update", "session": {
+            "voice": voice,
+            "instructions": instructions,
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}},
+                      "output": {"format": {"type": "audio/pcm", "rate": 24000}}},
+            "turn_detection": {"type": "server_vad"},
+            "tools": _eleven_tools(),
+        }}))
+        try:
+            while True:
+                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                t = ev.get("type", "")
+                if t in ("session.updated", "session.created"):
+                    if t == "session.updated":
+                        break
+                    continue
+                if t == "error":
+                    err = ev.get("error") or {}
+                    await ws.close()
+                    return {"ok": False, "error": str(err.get("message") or err)[:200]}
+        except asyncio.TimeoutError:
+            await ws.close()
+            return {"ok": False, "error": "xAI session setup timeout"}
+        _state["ws"] = ws
+        _state["model"] = model
+        _state["provider"] = "grok"
+        _state["session"] = "live"
+        _state["manual"] = False
+        _state["task"] = asyncio.create_task(_grok_reader(ws))
+        return {"ok": True, "model": model, "resumed": False,
+                "speak": s["spoken_answers"], "voice": voice, "provider": "grok"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
 def _eleven_tools() -> list:
@@ -801,6 +946,8 @@ async def _start_eleven(body: dict | None = None) -> dict:
 async def start(body: dict | None = None) -> dict:
     if _load_settings()["provider"] == "elevenlabs":
         return await _start_eleven(body)
+    if _load_settings()["provider"] == "grok":
+        return await _start_grok(body)
     if not _api_key():
         return {"ok": False, "error": "GOOGLE_API_KEY not set in ~/.hermes/.env"}
     await _cleanup()
@@ -893,8 +1040,8 @@ async def audio(body: dict) -> dict:
     if not data:
         return {"ok": True, "skipped": True}
     try:
-        if _state.get("provider") == "elevenlabs":
-            # Client captures 16 kHz; ElevenLabs requires 24 kHz PCM16.
+        if _state.get("provider") in ("elevenlabs", "grok"):
+            # Client captures 16 kHz; both OpenAI-protocol providers want 24 kHz PCM16.
             up = _resample_16_to_24(base64.b64decode(data))
             if up:
                 await ws.send(json.dumps({"type": "input_audio_buffer.append",
@@ -929,7 +1076,9 @@ async def poll(in_offset: int = 0, out_offset: int = 0, a_offset: int = 0, d_off
         "r_total": len(_state["recalls"]),
         "tool_in_flight": _state["tool_in_flight"],
         "interrupted": _state["interrupted"],
-        "model_setting": (_load_settings()["elevenlabs_model"] if _state.get("provider") == "elevenlabs" else _load_settings()["model"].replace("models/", "")),
+        "model_setting": (_load_settings()["elevenlabs_model"] if _state.get("provider") == "elevenlabs"
+                           else _load_settings()["grok_model"] if _state.get("provider") == "grok"
+                           else _load_settings()["model"].replace("models/", "")),
         "show_transcript": _load_settings()["show_transcript"],
         "show_log": _load_settings()["show_log"],
     }
@@ -952,7 +1101,7 @@ async def tool_response(body: dict) -> dict:
         return {"ok": False, "error": "missing tool call id"}
     _state["tool_in_flight"] = None
     try:
-        if _state.get("provider") == "elevenlabs":
+        if _state.get("provider") in ("elevenlabs", "grok"):
             # A response may still be streaming (fast agent answers): the
             # server drops response.create while one is active — wait it out.
             for _ in range(50):

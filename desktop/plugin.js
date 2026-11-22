@@ -870,8 +870,8 @@ function Minibar({ live }) {
 // through Hermes' official per-key writer. No config_schema form exists, so
 // there is no duplicate "Agent settings" entry. Field metadata (labels,
 // descriptions, choices) is served by the backend — single source of truth.
-// ElevenLabs shows as "soon" until its adapter ships; the backend sanitizes
-// provider to gemini, so we never offer a choice that would silently not apply.
+// Each provider shows only its OWN fields (the backend tags every field with a
+// scope); shared preferences stay visible in every mode.
 function LtSection({ title }) {
   return jsx('div', { className: 'mt-6 mb-1 flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-(--ui-text-tertiary)', children: [
     title,
@@ -913,7 +913,7 @@ function LiveSettings({ ctx }) {
   if (!data) return jsx('div', { className: 'p-4 text-sm text-(--ui-text-tertiary)', children: 'Loading settings…' })
 
   const { values, fields } = data
-  const provider = values.provider === 'elevenlabs' ? 'elevenlabs' : 'gemini'
+  const provider = ['elevenlabs', 'grok'].includes(values.provider) ? values.provider : 'gemini'
   const enumRow = k => fields[k] && jsx(ListRow, { title: fields[k].label, description: fields[k].description, action:
     jsx(Select, { value: String(values[k] ?? ''), onValueChange: v => set(k, v), children: [
       jsx(SelectTrigger, { className: 'w-60', children: jsx(SelectValue, {}) }),
@@ -925,6 +925,7 @@ function LiveSettings({ ctx }) {
   const providers = [
     { id: 'gemini', label: 'Gemini', grad: 'linear-gradient(135deg,#a5b4fc,#8f7bff)' },
     { id: 'elevenlabs', label: 'ElevenLabs', grad: 'linear-gradient(135deg,#4fd1c5,#7dffb2)' },
+    { id: 'grok', label: 'Grok', grad: 'linear-gradient(135deg,#f472b6,#a78bfa)' },
   ]
 
   // Per-provider settings: each provider shows its OWN fields only (the
@@ -955,10 +956,13 @@ function LiveSettings({ ctx }) {
     ownEnum('voice'),
     ownEnum('elevenlabs_model'),
     ownEnum('elevenlabs_voice'),
+    ownEnum('grok_model'),
+    ownEnum('grok_voice'),
     jsx(LtSection, { title: 'Language' }),
     ownEnum('primary_language'),
     ownEnum('secondary_language'),
     ownEnum('elevenlabs_language'),
+    ownEnum('grok_language'),
     jsx(LtSection, { title: 'Behavior' }),
     ownToggle('smart_transcription'),
     fields.spoken_answers && jsx(ListRow, { title: fields.spoken_answers.label, description: fields.spoken_answers.description, action:
@@ -973,7 +977,7 @@ function LiveSettings({ ctx }) {
 export default {
   id: ID,
   name: 'Livetalk',
-  description: 'Realtime voice chat with your Hermes agent — Gemini Live today, more providers tomorrow; full proxy in the local backend.',
+  description: 'Realtime voice chat with your Hermes agent — Gemini Live, ElevenLabs and Grok, proxied by the local backend.',
   register(ctx) {
     // idempotent injection: a failed load leaks the previous <style> (its
     // onDispose never runs), so the old full-bleed rules would outlive us —
