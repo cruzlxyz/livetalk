@@ -95,7 +95,7 @@ _state: dict = {
 
 
 def _api_key() -> str:
-    return _env_value("GOOGLE_API_KEY")
+    return _env_value("GOOGLE_API_KEY") or _env_value("GEMINI_API_KEY")
 
 
 def _mint_token() -> str:
@@ -536,25 +536,120 @@ _EL_TAG = re.compile(r"\[[A-Za-z][A-Za-z ,\-]{0,24}\]")
 EL_MINT = "https://api.elevenlabs.io/v1/convai/realtime/client_secrets"
 
 
-def _env_value(name: str) -> str:
-    """Process env first, then the Hermes .env files (launch home + ~/.hermes)."""
-    v = os.environ.get(name, "")
-    if v:
-        return v
-    homes = []
-    if os.environ.get("HERMES_HOME"):
-        homes.append(os.environ["HERMES_HOME"])
-    homes.append(os.path.join(os.path.expanduser("~"), ".hermes"))
-    for h in homes:
-        try:
-            with open(os.path.join(h, ".env"), encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith(name + "="):
-                        return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except OSError:
+def _plugin_home() -> str:
+    """The Hermes home this plugin is installed into.
+
+    ``<home>/plugins/<name>/dashboard/plugin_api.py`` → ``<home>``. Derived from this
+    file's own location because it is the only path that survives a routed profile:
+    under multiplexed Hermes the process environment carries the *launch* home, not the
+    profile a request belongs to. Deliberately **not** ``realpath``'d — a symlinked
+    ``~/.hermes/plugins/<name>`` must resolve to the Hermes home, not to the checkout it
+    points at.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(os.path.join(here, os.pardir, os.pardir, os.pardir))
+
+
+def _env_files() -> list[str]:
+    """``.env`` files to consult, in order: ``$HERMES_HOME``, this plugin's own home,
+    then ``~/.hermes``.
+
+    Deduplicated on the *resolved* path, so a symlinked layout reads each file once,
+    while the path returned stays the one computed here.
+    """
+    roots = (os.environ.get("HERMES_HOME"), _plugin_home(), os.path.expanduser("~/.hermes"))
+    seen: set[str] = set()
+    files: list[str] = []
+    for root in roots:
+        if not root:
             continue
+        path = os.path.join(root, ".env")
+        key = os.path.realpath(path)      # dedupe only — never rewrites the lookup path
+        if key not in seen:
+            seen.add(key)
+            files.append(path)
+    return files
+
+
+_dotenv_cache: dict[str, tuple[float, dict[str, str]]] = {}
+
+
+def _read_dotenv(path: str) -> dict[str, str]:
+    """Minimal ``.env`` reader: one ``KEY=VALUE`` per line, ``#`` comments, optional
+    ``export`` prefix and quotes.
+
+    Cached per path as ``(mtime, values)``: a ``/start`` asks for three keys, and an
+    edited file is picked up without a restart.
+    """
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        _dotenv_cache.pop(path, None)
+        return {}
+    cached = _dotenv_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    values: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if key.startswith("export "):
+                    key = key[7:].strip()
+                values[key] = _dotenv_value(value)
+    except OSError:
+        return {}
+    _dotenv_cache[path] = (mtime, values)
+    return values
+
+
+def _dotenv_value(raw: str) -> str:
+    """Value side of a ``KEY=VALUE`` line.
+
+    A quoted value keeps everything up to its closing quote (so ``KEY="a # b"`` survives);
+    an unquoted one loses a trailing `` # comment`` (so ``KEY=x  # old key`` is not
+    handed to the provider as a key).
+    """
+    value = raw.strip()
+    if value[:1] in ('"', "'"):
+        quote = value[0]
+        end = value.find(quote, 1)
+        return value[1:end] if end > 0 else value[1:]
+    if " #" in value:
+        value = value.split(" #", 1)[0].strip()
+    return value
+
+
+def _env_value(name: str) -> str:
+    """Process env first, then the Hermes ``.env`` files.
+
+    The environment alone is not enough: Hermes loads only the *launch* home's ``.env``
+    into ``os.environ``, while a named profile's ``.env``
+    (``~/.hermes/profiles/<name>/.env``) deliberately stays out of it — and that is
+    exactly where Hermes' Providers page writes the key.
+
+    An unresolved ``op://`` reference (1Password secret source) counts as unset rather
+    than being handed to the provider as a key.
+    """
+    value = (os.environ.get(name) or "").strip()
+    if value and not value.startswith("op://"):
+        return value
+    for path in _env_files():
+        value = (_read_dotenv(path).get(name) or "").strip()
+        if value and not value.startswith("op://"):
+            return value
     return ""
+
+
+def _missing_key_error(*names: str) -> str:
+    """Point at every file actually consulted instead of naming one hardcoded path."""
+    return (f"{' or '.join(names)} not set (looked in the environment and in: "
+            + ", ".join(_env_files()) + ")")
 
 
 def _eleven_key() -> str:
@@ -693,7 +788,7 @@ async def _start_grok(body: dict | None = None) -> dict:
     import websockets
     key = _xai_key()
     if not key:
-        return {"ok": False, "error": "XAI_API_KEY not set in the environment or ~/.hermes/.env"}
+        return {"ok": False, "error": _missing_key_error("XAI_API_KEY")}
     s = _load_settings()
     model = s["grok_model"]
     voice = s["grok_voice"]
@@ -881,7 +976,7 @@ async def _start_eleven(body: dict | None = None) -> dict:
     import websockets
     key = _eleven_key()
     if not key:
-        return {"ok": False, "error": "ELEVENLABS_API_KEY not set in the environment or ~/.hermes/.env"}
+        return {"ok": False, "error": _missing_key_error("ELEVENLABS_API_KEY")}
     s = _load_settings()
     model = s["elevenlabs_model"]
     voice = _resolve_eleven_voice(s["elevenlabs_voice"])
@@ -949,7 +1044,7 @@ async def start(body: dict | None = None) -> dict:
     if _load_settings()["provider"] == "grok":
         return await _start_grok(body)
     if not _api_key():
-        return {"ok": False, "error": "GOOGLE_API_KEY not set in ~/.hermes/.env"}
+        return {"ok": False, "error": _missing_key_error("GOOGLE_API_KEY", "GEMINI_API_KEY")}
     await _cleanup()
     _state.update({"session": None, "ws": None, "model": "", "provider": "", "input": [], "output": [], "audio": [], "error": "", "usage": None, "interaction": "", "delegations": [], "recalls": [], "tool_in_flight": None, "interrupted": 0, "responding": False})
     import websockets
