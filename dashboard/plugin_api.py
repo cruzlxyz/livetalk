@@ -95,7 +95,7 @@ _state: dict = {
 
 
 def _api_key() -> str:
-    return _env_value("GOOGLE_API_KEY")
+    return _env_value("GOOGLE_API_KEY") or _env_value("GEMINI_API_KEY")
 
 
 def _mint_token() -> str:
@@ -542,7 +542,9 @@ def _plugin_home() -> str:
     ``<home>/plugins/<name>/dashboard/plugin_api.py`` → ``<home>``. Derived from this
     file's own location because it is the only path that survives a routed profile:
     under multiplexed Hermes the process environment carries the *launch* home, not the
-    profile a request belongs to.
+    profile a request belongs to. Deliberately **not** ``realpath``'d — a symlinked
+    ``~/.hermes/plugins/<name>`` must resolve to the Hermes home, not to the checkout it
+    points at.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(here, os.pardir, os.pardir, os.pardir))
@@ -550,14 +552,44 @@ def _plugin_home() -> str:
 
 def _env_files() -> list[str]:
     """``.env`` files to consult, in order: ``$HERMES_HOME``, this plugin's own home,
-    then ``~/.hermes``. Deduplicated so a symlinked layout reads each file once."""
+    then ``~/.hermes``.
+
+    Deduplicated on the *resolved* path, so a symlinked layout reads each file once,
+    while the path returned stays the one computed here.
+    """
     roots = (os.environ.get("HERMES_HOME"), _plugin_home(), os.path.expanduser("~/.hermes"))
-    return list(dict.fromkeys(os.path.join(r, ".env") for r in roots if r))
+    seen: set[str] = set()
+    files: list[str] = []
+    for root in roots:
+        if not root:
+            continue
+        path = os.path.join(root, ".env")
+        key = os.path.realpath(path)      # dedupe only — never rewrites the lookup path
+        if key not in seen:
+            seen.add(key)
+            files.append(path)
+    return files
+
+
+_dotenv_cache: dict[str, tuple[float, dict[str, str]]] = {}
 
 
 def _read_dotenv(path: str) -> dict[str, str]:
     """Minimal ``.env`` reader: one ``KEY=VALUE`` per line, ``#`` comments, optional
-    ``export`` prefix and surrounding quotes."""
+    ``export`` prefix and quotes.
+
+    Cached per path as ``(mtime, values)``: a ``/start`` asks for three keys, and an
+    edited file is picked up without a restart.
+    """
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        _dotenv_cache.pop(path, None)
+        return {}
+    cached = _dotenv_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
     values: dict[str, str] = {}
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -569,10 +601,28 @@ def _read_dotenv(path: str) -> dict[str, str]:
                 key = key.strip()
                 if key.startswith("export "):
                     key = key[7:].strip()
-                values[key] = value.strip().strip('"').strip("'")
+                values[key] = _dotenv_value(value)
     except OSError:
-        pass
+        return {}
+    _dotenv_cache[path] = (mtime, values)
     return values
+
+
+def _dotenv_value(raw: str) -> str:
+    """Value side of a ``KEY=VALUE`` line.
+
+    A quoted value keeps everything up to its closing quote (so ``KEY="a # b"`` survives);
+    an unquoted one loses a trailing `` # comment`` (so ``KEY=x  # old key`` is not
+    handed to the provider as a key).
+    """
+    value = raw.strip()
+    if value[:1] in ('"', "'"):
+        quote = value[0]
+        end = value.find(quote, 1)
+        return value[1:end] if end > 0 else value[1:]
+    if " #" in value:
+        value = value.split(" #", 1)[0].strip()
+    return value
 
 
 def _env_value(name: str) -> str:
@@ -596,9 +646,9 @@ def _env_value(name: str) -> str:
     return ""
 
 
-def _missing_key_error(name: str) -> str:
+def _missing_key_error(*names: str) -> str:
     """Point at every file actually consulted instead of naming one hardcoded path."""
-    return (f"{name} not set (looked in the environment and in: "
+    return (f"{' or '.join(names)} not set (looked in the environment and in: "
             + ", ".join(_env_files()) + ")")
 
 
@@ -994,7 +1044,7 @@ async def start(body: dict | None = None) -> dict:
     if _load_settings()["provider"] == "grok":
         return await _start_grok(body)
     if not _api_key():
-        return {"ok": False, "error": _missing_key_error("GOOGLE_API_KEY")}
+        return {"ok": False, "error": _missing_key_error("GOOGLE_API_KEY", "GEMINI_API_KEY")}
     await _cleanup()
     _state.update({"session": None, "ws": None, "model": "", "provider": "", "input": [], "output": [], "audio": [], "error": "", "usage": None, "interaction": "", "delegations": [], "recalls": [], "tool_in_flight": None, "interrupted": 0, "responding": False})
     import websockets

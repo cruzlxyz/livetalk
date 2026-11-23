@@ -1,6 +1,6 @@
 name: livetalk
 label: Livetalk
-version: 2.2.0
+version: 2.2.1
 description: "Realtime duplex voice chat with your Hermes agent — Gemini Live today, more voice providers tomorrow. A composer minibar; talk to your agent hands-free."
 manifest_version: 1
 kind: backend
