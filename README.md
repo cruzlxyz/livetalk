@@ -40,14 +40,14 @@ Pick the provider in **Settings → Plugins → livetalk**. Each provider keeps 
 - **Live transcript** — both sides rendered as flowing sentences (streaming fragments merged per speaker). Toggleable.
 - **Session token meter** — real `usageMetadata` from Google, shown as `12.3k tok`, reset per session.
 - **Session resumption + auto-redial** — a network drop reconnects with the resumption handle, keeping context. A manual stop never reconnects.
-- **Secure by design** — API keys live in `~/.hermes/.env` and never leave the backend process. The UI only receives short-lived session tokens.
+- **Secure by design** — API keys live in your Hermes `.env` (`~/.hermes/.env`, or `<profile>/.env` under `~/.hermes/profiles/` when you run a named profile) and never leave the backend process. The UI only receives short-lived session tokens.
 
 ## Requirements
 
 | | |
 |---|---|
 | **Hermes** | Desktop app with plugin support; **tested on v0.23.3** (`requires_hermes: >=0.22.0`). The settings page needs a build with `registerSettingsPage` (~0.23+). |
-| **API key** | One per provider you use, in `~/.hermes/.env`: `GOOGLE_API_KEY` ([AI Studio](https://aistudio.google.com/apikey)), `ELEVENLABS_API_KEY` ([elevenlabs.io](https://elevenlabs.io)), `XAI_API_KEY` ([console.x.ai](https://console.x.ai)) |
+| **API key** | One per provider you use, in your Hermes `.env` — `~/.hermes/.env`, or `~/.hermes/profiles/<name>/.env` for a named profile: `GOOGLE_API_KEY` ([AI Studio](https://aistudio.google.com/apikey)), `ELEVENLABS_API_KEY` ([elevenlabs.io](https://elevenlabs.io)), `XAI_API_KEY` ([console.x.ai](https://console.x.ai)) |
 | **Python** | Nothing extra — the backend uses only Hermes-bundled packages (`fastapi`, `websockets`) |
 | **Hardware** | Microphone + speakers/headphones (headphones strongly recommended — see Tips) |
 | **OS** | Windows / macOS / Linux desktop |
@@ -60,13 +60,15 @@ hermes plugins install cruzlxyz/livetalk
 
 This installs both halves (the Python dashboard backend and the desktop mini-bar), then restart the desktop app once.
 
-**One-time setup** — put at least one key in `~/.hermes/.env`:
+**One-time setup** — put at least one key in your Hermes `.env`:
 
 ```
 GOOGLE_API_KEY=AIza...
 ELEVENLABS_API_KEY=sk_...
 XAI_API_KEY=xai-...
 ```
+
+That file is `~/.hermes/.env`, or `~/.hermes/profiles/<name>/.env` when you run a named Hermes profile — the Providers page in the Hermes dashboard writes it there. The backend reads the process environment first and falls back to both files, so either location works; a `/start` failure names every path it looked in.
 
 Then click the blob in the status bar and just talk.
 
