@@ -666,7 +666,9 @@ function createLive(ctx) {
         return
       }
       startPolling()
-      addLog(`LIVE — ${r.model} (mic streaming)`)
+      addLog(`LIVE — ${r.model}`
+        + (r.voice ? ` · voice ${r.voice}` : '')
+        + ` (mic streaming${r.resumed ? ', resumed' : ''})`)
       status.set('live')
       message.set('')
     } catch (e) {

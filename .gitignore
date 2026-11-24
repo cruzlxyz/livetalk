@@ -4,3 +4,4 @@ __pycache__/
 memory.json
 .DS_Store
 .hermes-catalog.json
+.resume-grok.json

@@ -36,7 +36,8 @@ router = APIRouter()
 
 DEFAULT_MODEL = "models/gemini-3.8-live"
 _DIR = os.path.dirname(__file__)
-RESUME_FILE = os.path.join(_DIR, ".resume.json")   # last resumable session handle
+RESUME_FILE = os.path.join(_DIR, ".resume.json")   # Gemini: last resumable session handle
+GROK_RESUME_FILE = os.path.join(_DIR, ".resume-grok.json")   # xAI: conversation_id for replay
 
 # Transcription language hints (AudioTranscriptionConfig.languageCodes — BCP-47).
 # Hints reduce wrong-language detection on short prompts; an empty list means
@@ -122,12 +123,52 @@ def _load_resume() -> dict:
         return {}
 
 
-def _save_resume(handle: str, model: str) -> None:
+def _save_resume(handle: str, model: str, voice: str = "") -> None:
+    """Store the handle together with the model AND voice that created it.
+
+    Gemini keeps the voice of the session that owns the handle and ignores a
+    new speechConfig on a resumed setup, so a voice change must force a fresh
+    session (issue #3)."""
     try:
         with open(RESUME_FILE, "w", encoding="utf-8") as fh:
-            json.dump({"handle": handle, "model": model, "t": time.time()}, fh)
+            json.dump({"handle": handle, "model": model, "voice": voice, "t": time.time()}, fh)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _load_grok_resume() -> dict:
+    """Stored xAI conversation id ({conversation_id, model, voice, t}) or {}."""
+    try:
+        with open(GROK_RESUME_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_grok_resume(conversation_id: str, model: str, voice: str) -> None:
+    """xAI replays cached turns when a reconnect passes ?conversation_id=.
+    History expires after 30 minutes of inactivity, so the entry is timestamped."""
+    try:
+        with open(GROK_RESUME_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"conversation_id": conversation_id, "model": model, "voice": voice, "t": time.time()}, fh)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _grok_resume_id(model: str, voice: str) -> str:
+    """Only resume when model AND voice match and the cache is still warm."""
+    st = _load_grok_resume()
+    if not st.get("conversation_id"):
+        return ""
+    if st.get("model") != model or st.get("voice") != voice:
+        return ""
+    try:
+        if time.time() - float(st.get("t") or 0) > 1800:      # xAI drops history after 30 min
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(st["conversation_id"])
 
 
 def _candidates() -> list[str]:
@@ -179,7 +220,7 @@ async def _reader(ws) -> None:
             sru = msg.get("sessionResumptionUpdate")
             if sru and sru.get("newHandle") and sru.get("resumable"):
                 _state["handle"] = sru["newHandle"]
-                _save_resume(sru["newHandle"], _state.get("model", ""))
+                _save_resume(sru["newHandle"], _state.get("model", ""), _state.get("voice", ""))
             if msg.get("usageMetadata"):
                 _state["usage"] = msg["usageMetadata"]
             sc = msg.get("serverContent")
@@ -230,9 +271,23 @@ async def _reader(ws) -> None:
         _state["error"] = f"upstream closed: {exc}"[:200]
     finally:
         _state["session"] = None
-        # Auto-redial: unexpected drop (not a user /close) with a valid handle
-        # -> reconnect in the background so the conversation keeps its context.
-        if not _state["manual"] and _state["redials"] < 2 and _state.get("handle"):
+        err_text = _state.get("error", "")
+        stale_config = ("not supported for this model configuration" in err_text
+                        or "CONTENT_TYPE_AUDIO" in err_text)
+        if stale_config:
+            # A resumed session carried the previous model's configuration and the
+            # server refused audio (close 1007). Drop the stale handle and dial a
+            # brand-new session once — never leave the user stuck.
+            try:
+                os.remove(RESUME_FILE)
+            except OSError:
+                pass
+            _state["handle"] = ""
+            if not _state["manual"] and _state["redials"] < 1:
+                _state["redials"] += 1
+                asyncio.get_event_loop().create_task(start({"_auto": True, "resume": False}))
+        elif not _state["manual"] and _state["redials"] < 2 and _state.get("handle"):
+            # Unexpected drop with a valid handle -> reconnect keeping context.
             _state["redials"] += 1
             asyncio.get_event_loop().create_task(start({"_auto": True, "resume": True}))
 
@@ -732,7 +787,11 @@ async def _grok_reader(ws) -> None:
                 frame = frame.decode("utf-8", "replace")
             ev = json.loads(frame)
             t = ev.get("type", "")
-            if t == "response.created":
+            if t == "conversation.created":
+                cid = str((ev.get("conversation") or {}).get("id") or "")
+                if cid:
+                    _save_grok_resume(cid, _state.get("model", ""), _state.get("voice", ""))
+            elif t == "response.created":
                 _state["responding"] = True
             elif t == "response.output_audio.delta":
                 d = ev.get("delta") or ""
@@ -805,7 +864,9 @@ async def _start_grok(body: dict | None = None) -> dict:
     if transcription:
         instructions += chr(10) + "The user speaks in the language hinted by the transcription setting."
     try:
-        ws = await websockets.connect(f"{XAI_HOST}?model={model}",
+        resume_id = _grok_resume_id(model, voice) if (body or {}).get("resume") else ""
+        url = f"{XAI_HOST}?model={model}" + (f"&conversation_id={resume_id}" if resume_id else "")
+        ws = await websockets.connect(url,
                                       additional_headers={"Authorization": f"Bearer {key}"},
                                       open_timeout=15, close_timeout=5)
         await ws.send(json.dumps({"type": "session.update", "session": {
@@ -814,12 +875,18 @@ async def _start_grok(body: dict | None = None) -> dict:
             "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}},
                       "output": {"format": {"type": "audio/pcm", "rate": 24000}}},
             "turn_detection": {"type": "server_vad"},
+            "resumption": {"enabled": True},       # opt in: caches turns for ?conversation_id=
             "tools": _eleven_tools(),
         }}))
         try:
             while True:
                 ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
                 t = ev.get("type", "")
+                if t == "conversation.created":
+                    cid = str((ev.get("conversation") or {}).get("id") or "")
+                    if cid:
+                        _save_grok_resume(cid, model, voice)
+                    continue
                 if t in ("session.updated", "session.created"):
                     if t == "session.updated":
                         break
@@ -827,17 +894,21 @@ async def _start_grok(body: dict | None = None) -> dict:
                 if t == "error":
                     err = ev.get("error") or {}
                     await ws.close()
+                    if resume_id:      # stale conversation id -> dial fresh once
+                        return await _start_grok({**(body or {}), "resume": False})
                     return {"ok": False, "error": str(err.get("message") or err)[:200]}
         except asyncio.TimeoutError:
             await ws.close()
             return {"ok": False, "error": "xAI session setup timeout"}
         _state["ws"] = ws
         _state["model"] = model
+        _state["voice"] = voice
         _state["provider"] = "grok"
         _state["session"] = "live"
         _state["manual"] = False
         _state["task"] = asyncio.create_task(_grok_reader(ws))
-        return {"ok": True, "model": model, "resumed": False,
+        _state["resumed"] = bool(resume_id)
+        return {"ok": True, "model": model, "resumed": bool(resume_id),
                 "speak": s["spoken_answers"], "voice": voice, "provider": "grok"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
@@ -987,26 +1058,57 @@ async def _start_eleven(body: dict | None = None) -> dict:
                    "error": "", "usage": None, "interaction": "", "delegations": [], "recalls": [],
                    "tool_in_flight": None, "interrupted": 0, "resumed": False, "responding": False})
     try:
-        minted = await asyncio.to_thread(_eleven_mint, model, voice, language, ctx_text)
-        secret = minted.get("value") or ""
-        if not secret:
-            return {"ok": False, "error": "mint failed: no client secret returned"}
-        ws = await websockets.connect(f"{EL_HOST}?model={model}",
-                                      additional_headers={"Authorization": f"Bearer {secret}"},
-                                      open_timeout=15, close_timeout=5)
-        try:
-            while True:
-                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-                t = ev.get("type", "")
-                if t in ("session.created", "session.updated"):
+        # The first session.created can be slow (seen: connected but silent for
+        # >10s, then instant on the next dial), so give it a generous window and
+        # retry the whole mint+dial twice. A session.update is sent when the
+        # socket stays quiet, which also nudges the server to answer.
+        ws = None
+        last_err = ""
+        for attempt in range(1, 3):
+            minted = await asyncio.to_thread(_eleven_mint, model, voice, language, ctx_text)
+            secret = minted.get("value") or ""
+            if not secret:
+                last_err = "mint failed: no client secret returned"
+                continue
+            ws = await websockets.connect(f"{EL_HOST}?model={model}",
+                                          additional_headers={"Authorization": f"Bearer {secret}"},
+                                          open_timeout=15, close_timeout=5)
+            ok = False
+            started = time.time()
+            nudged = False
+            try:
+                while time.time() - started < 25:
+                    if not nudged and time.time() - started > 6:
+                        nudged = True
+                        await ws.send(json.dumps({"type": "session.update", "session": {}}))
+                    try:
+                        frame = await asyncio.wait_for(ws.recv(), timeout=2)
+                    except asyncio.TimeoutError:
+                        continue
+                    ev = json.loads(frame)
+                    t = ev.get("type", "")
+                    if t in ("session.created", "session.updated"):
+                        ok = True
+                        break
+                    if t == "error":
+                        err = ev.get("error") or {}
+                        last_err = str(err.get("message") or err)[:200]
+                        break
+                if ok:
                     break
-                if t == "error":
-                    err = ev.get("error") or {}
+                await ws.close()
+                ws = None
+                if not last_err:
+                    last_err = "ElevenLabs session setup timeout"
+            except Exception as exc:  # noqa: BLE001 — retry once
+                last_err = f"setup failed: {type(exc).__name__}: {exc}"[:200]
+                try:
                     await ws.close()
-                    return {"ok": False, "error": str(err.get("message") or err)[:200]}
-        except asyncio.TimeoutError:
-            await ws.close()
-            return {"ok": False, "error": "ElevenLabs session setup timeout"}
+                except Exception:  # noqa: BLE001
+                    pass
+                ws = None
+        if ws is None:
+            return {"ok": False, "error": last_err or "ElevenLabs session setup failed"}
         _state["ws"] = ws
         _state["model"] = model
         _state["provider"] = "elevenlabs"
@@ -1028,8 +1130,10 @@ async def _start_eleven(body: dict | None = None) -> dict:
             except Exception:  # noqa: BLE001 — the reader reports the real state
                 return
         _state["keepalive"] = asyncio.create_task(keepalive())
+        # keep the log line short: "Bella - Professional, Bright, Warm" -> "Bella"
+        label = next((v["name"].split(" - ")[0] for v in _eleven_voices() if v["id"] == voice), voice)
         return {"ok": True, "model": model, "resumed": False,
-                "speak": s["spoken_answers"], "voice": voice, "provider": "elevenlabs"}
+                "speak": s["spoken_answers"], "voice": label, "provider": "elevenlabs"}
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:160]
         return {"ok": False, "error": f"mint failed: HTTP {e.code} {detail}"}
@@ -1053,6 +1157,8 @@ async def start(body: dict | None = None) -> dict:
     # and the minibar picker both write the same value (single source of truth).
     candidates = _candidates()
     wanted = _load_settings()["model"]
+    voice = _load_settings()["voice"]
+    _state["voice"] = voice      # the reader persists it with every new handle
     want_resume = bool((body or {}).get("resume"))
     if not (body or {}).get("_auto"):
         _state["redials"] = 0          # user-initiated start resets the redial budget
@@ -1067,7 +1173,7 @@ async def start(body: dict | None = None) -> dict:
             name = await asyncio.to_thread(_mint_token)
             ws = await websockets.connect(f"{WS_HOST}?access_token={name}", open_timeout=10, close_timeout=5)
             gen_cfg = {"responseModalities": ["AUDIO"],
-                       "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": _load_settings()["voice"]}}}}
+                       "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}}
             # Session resumption: first attempt may reuse the stored handle; any
             # retry falls back to a fresh session (expired handles are rejected).
             setup: dict = {
@@ -1082,7 +1188,7 @@ async def start(body: dict | None = None) -> dict:
             resumed_now = False
             if want_resume and model not in skip_handle:
                 h = _load_resume()
-                if h.get("handle") and h.get("model") == model:
+                if h.get("handle") and h.get("model") == model and h.get("voice", "") == voice:
                     setup["sessionResumption"] = {"handle": h["handle"]}
                     resumed_now = True
             await ws.send(json.dumps({"setup": setup}))
@@ -1096,7 +1202,7 @@ async def start(body: dict | None = None) -> dict:
                     sru = msg.get("sessionResumptionUpdate")
                     if sru and sru.get("newHandle") and sru.get("resumable"):
                         _state["handle"] = sru["newHandle"]
-                        _save_resume(sru["newHandle"], model)
+                        _save_resume(sru["newHandle"], model, voice)
                     if "setupComplete" in msg:
                         setup_ok = True
                         break

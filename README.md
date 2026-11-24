@@ -39,7 +39,7 @@ Pick the provider in **Settings → Plugins → livetalk**. Each provider keeps 
 - **Liquid blob indicator** — one animated blob instead of text: violet and swelling with your voice while listening, green while the model speaks, spinning teal while the agent works. Click it to start/stop.
 - **Live transcript** — both sides rendered as flowing sentences (streaming fragments merged per speaker). Toggleable.
 - **Session token meter** — real `usageMetadata` from Google, shown as `12.3k tok`, reset per session.
-- **Session resumption + auto-redial** — a network drop reconnects with the resumption handle, keeping context. A manual stop never reconnects.
+- **Session resumption + auto-redial** — a network drop reconnects with the resumption handle, keeping context. A manual stop never reconnects. Resumption is model- and voice-aware: changing either value opens a fresh session instead of replaying the old configuration, and a rejected stale handle is dropped once and redialled clean. Grok replays its cached turns for 30 minutes.
 - **Secure by design** — API keys live in your Hermes `.env` (`~/.hermes/.env`, or `<profile>/.env` under `~/.hermes/profiles/` when you run a named profile) and never leave the backend process. The UI only receives short-lived session tokens.
 
 ## Requirements
@@ -127,7 +127,7 @@ One page, provider-aware — only the active provider's fields are shown.
 | `GET` | `/config` | `{ model, candidates[], show_transcript, show_log }` — model catalog + toggles |
 | `GET` | `/settings` | Settings page data: `{ values, fields }` for the active provider |
 | `POST` | `/settings` | Persist settings (per-provider keys kept apart) |
-| `POST` | `/start` | Dial the active provider → live session. Returns `{ ok, model, provider, resumed, speak }` |
+| `POST` | `/start` | Dial the active provider → live session. Returns `{ ok, model, provider, resumed, voice, speak }` |
 | `POST` | `/audio` | Forward one mic chunk upstream (`{ data: <base64 PCM16 mono 16kHz> }`) |
 | `GET` | `/poll` | Incremental state: transcriptions, audio, delegations, recalls, usage, barge-in counter — all offset-based |
 | `POST` | `/tool_response` | Answer a queued `talk` delegation or a `recall` lookup |
