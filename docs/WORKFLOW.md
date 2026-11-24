@@ -48,4 +48,4 @@ flowchart LR
 - **Redial**: any socket error retries the next candidate model; user-initiated starts reset the redial budget.
 - **Session resumption**: the last handle is stored in `dashboard/.resume.json`; a stale handle falls back to a fresh session (deleting the file forces a clean context).
 - **Receipt cap**: an unanswered delegation times out after 5 minutes and tells the voice side, so the model never hangs forever.
-- **Settings migration**: old `lang` preset keys migrate to the primary/secondary/smart trio in `dashboard/.settings.json`; unknown codes are rejected server-side.
+- **Settings storage**: settings live in `config.yaml` under `plugins.entries.livetalk.settings`, read and written through Hermes' public config API; unknown keys and out-of-range enum values are rejected server-side.

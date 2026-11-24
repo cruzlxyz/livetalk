@@ -40,14 +40,14 @@ Pick the provider in **Settings → Plugins → livetalk**. Each provider keeps 
 - **Live transcript** — both sides rendered as flowing sentences (streaming fragments merged per speaker). Toggleable.
 - **Session token meter** — real `usageMetadata` from Google, shown as `12.3k tok`, reset per session.
 - **Session resumption + auto-redial** — a network drop reconnects with the resumption handle, keeping context. A manual stop never reconnects. Resumption is model- and voice-aware: changing either value opens a fresh session instead of replaying the old configuration, and a rejected stale handle is dropped once and redialled clean. Grok replays its cached turns for 30 minutes.
-- **Secure by design** — API keys live in your Hermes `.env` (`~/.hermes/.env`, or `<profile>/.env` under `~/.hermes/profiles/` when you run a named profile) and never leave the backend process. The UI only receives short-lived session tokens.
+- **Secure by design** — API keys live in Hermes' credential store (Settings → Providers, or your Hermes `.env`) and never leave the backend process; the plugin never parses `.env` itself. The UI only receives short-lived session tokens.
 
 ## Requirements
 
 | | |
 |---|---|
-| **Hermes** | Desktop app with plugin support; **tested on v0.23.3** (`requires_hermes: >=0.22.0`). The settings page needs a build with `registerSettingsPage` (~0.23+). |
-| **API key** | One per provider you use, in your Hermes `.env` — `~/.hermes/.env`, or `~/.hermes/profiles/<name>/.env` for a named profile: `GOOGLE_API_KEY` ([AI Studio](https://aistudio.google.com/apikey)), `ELEVENLABS_API_KEY` ([elevenlabs.io](https://elevenlabs.io)), `XAI_API_KEY` ([console.x.ai](https://console.x.ai)) |
+| **Hermes** | Desktop app with plugin support; **tested on v0.23.3** (`requires_hermes: >=0.23.0`). The settings page needs a build with `registerSettingsPage`, and keys resolve through the credential scope Hermes installs per plugin route. |
+| **API key** | One per provider you use, set in the dashboard's **Settings → Providers** page (or your Hermes `.env`): `GOOGLE_API_KEY` ([AI Studio](https://aistudio.google.com/apikey)), `ELEVENLABS_API_KEY` ([elevenlabs.io](https://elevenlabs.io)), `XAI_API_KEY` ([console.x.ai](https://console.x.ai)). Only the key of the provider you actually select is required. |
 | **Python** | Nothing extra — the backend uses only Hermes-bundled packages (`fastapi`, `websockets`) |
 | **Hardware** | Microphone + speakers/headphones (headphones strongly recommended — see Tips) |
 | **OS** | Windows / macOS / Linux desktop |
@@ -60,7 +60,7 @@ hermes plugins install cruzlxyz/livetalk
 
 This installs both halves (the Python dashboard backend and the desktop mini-bar), then restart the desktop app once.
 
-**One-time setup** — put at least one key in your Hermes `.env`:
+**One-time setup** — set at least one key in the dashboard's **Settings → Providers** page (that is where Hermes stores it; a plain Hermes `.env` also works):
 
 ```
 GOOGLE_API_KEY=AIza...
@@ -68,7 +68,7 @@ ELEVENLABS_API_KEY=sk_...
 XAI_API_KEY=xai-...
 ```
 
-That file is `~/.hermes/.env`, or `~/.hermes/profiles/<name>/.env` when you run a named Hermes profile — the Providers page in the Hermes dashboard writes it there. The backend reads the process environment first and falls back to both files, so either location works; a `/start` failure names every path it looked in.
+The backend resolves keys through Hermes' credential store, which the host scopes per plugin request — so a named profile's key is the one that resolves, and the plugin never parses `.env` itself. Only the key of the provider you select is required; a `/start` failure names the missing variable and points at the Providers page.
 
 Then click the blob in the status bar and just talk.
 
@@ -116,7 +116,7 @@ One page, provider-aware — only the active provider's fields are shown.
 
 ## What this plugin touches
 
-- **Dashboard API** (`dashboard/plugin_api.py`): FastAPI routes under `/api/plugins/livetalk/*` — session proxy for both providers, delegation + recall queues, settings read/write.
+- **Dashboard API** (`dashboard/plugin_api.py`): FastAPI routes under `/api/plugins/livetalk/*` — session proxy for all three providers, delegation + recall queues, settings read/write.
 - **Desktop surface** (`desktop/plugin.js`): one composer blob + popover (blob control, token counter, transcript, log), mic capture, playback queue, delegation worker.
 - **One agent session**: creates and reuses a Hermes session titled "Livetalk" for all delegations. No agent tools, no hooks, no middleware, no core overrides.
 
@@ -132,7 +132,7 @@ One page, provider-aware — only the active provider's fields are shown.
 | `GET` | `/poll` | Incremental state: transcriptions, audio, delegations, recalls, usage, barge-in counter — all offset-based |
 | `POST` | `/tool_response` | Answer a queued `talk` delegation or a `recall` lookup |
 | `POST` | `/close` | Tear down the session (blocks auto-redial) |
-| `GET` | `/status` | Liveness probe |
+| `GET` | `/status` | `{ session, model, provider, api_key_env, api_key_configured }` — liveness + the active provider's key state |
 
 ## How it works
 
@@ -171,7 +171,7 @@ Full details and diagrams: [docs/WORKFLOW.md](docs/WORKFLOW.md).
 - **Settings page** needs a Hermes build with plugin settings pages (~0.23+). Older builds: everything works, the page just does not appear.
 - **`gemini-3.8-live-extended-thinking` is deliberately not offered** — verified live, that model never emits tool calls, so it cannot delegate or recall. The picker only lists models that can do real work.
 - Transcription language hints follow the [Live API transcription docs](https://aistudio.google.com/docs/live-api/live-transcribe) (`languageCodes`, SMART mode, custom vocabulary).
-- The backend reads the plugin settings store through two Hermes-internal helpers (`_plugin_settings_entry`, `save_plugin_setting`) because no public seam exists yet; every call is wrapped, so a future rename degrades to defaults instead of breaking a session.
+- The backend reads and writes its settings through Hermes' public config surface (`load_config_readonly()` / `save_config()` on `plugins.entries.livetalk.settings`), so there is no private-helper dependency to break on a Hermes release.
 
 ## Privacy
 

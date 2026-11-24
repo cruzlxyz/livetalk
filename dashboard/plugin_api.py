@@ -24,6 +24,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -64,6 +65,50 @@ _VOICE_NAMES = frozenset([
     "Vindemiatrix", "Sulafat",
 ])
 _PLUGIN_NAME = "livetalk"
+_SETTINGS_PATH = ("plugins", "entries", _PLUGIN_NAME, "settings")
+_SETTINGS_WRITE_LOCK = threading.Lock()
+
+
+def _settings_node() -> dict:
+    """The plugin's user-visible settings: ``plugins.entries.livetalk.settings``.
+
+    Read through ``hermes_cli.config``, a documented public surface (catalog rule 9),
+    so nothing here breaks when Hermes reshapes a private helper. Never raises —
+    settings must not take a session down.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        node = load_config_readonly() or {}
+        for segment in _SETTINGS_PATH:
+            node = node.get(segment) if isinstance(node, dict) else None
+        return dict(node) if isinstance(node, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_settings(values: dict) -> None:
+    """Persist settings through the public config API (``save_config``).
+
+    ``merge_existing`` keeps every section this plugin does not own; the write is
+    serialised because several seams (Settings form, model picker, minibar) can land
+    at once. Raises ``PermissionError`` on a managed install, like the core writer.
+    """
+    from hermes_cli.config import load_config, save_config
+    with _SETTINGS_WRITE_LOCK:
+        cfg = load_config()
+        node = cfg
+        for segment in _SETTINGS_PATH[:-1]:
+            child = node.get(segment)
+            if not isinstance(child, dict):
+                child = {}
+                node[segment] = child
+            node = child
+        stored = node.get(_SETTINGS_PATH[-1])
+        if not isinstance(stored, dict):
+            stored = {}
+            node[_SETTINGS_PATH[-1]] = stored
+        stored.update(values)
+        save_config(cfg, merge_existing=True)
 
 
 LIST_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -176,8 +221,11 @@ def _candidates() -> list[str]:
     if not key:
         return [DEFAULT_MODEL]
     try:
-        req = urllib.request.Request(f"{LIST_MODELS_URL}?key={key}&pageSize=200",
-                                     headers={"User-Agent": "hermes-livetalk"})
+        # Header auth, never ?key= — a credential in a query string is captured by any
+        # request-URL log between here and Google (the mint above already does this).
+        req = urllib.request.Request(f"{LIST_MODELS_URL}?pageSize=200",
+                                     headers={"User-Agent": "hermes-livetalk",
+                                              "x-goog-api-key": key})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         names = [
@@ -302,10 +350,7 @@ def _load_settings() -> dict:
                 "spoken_answers": "full", "show_transcript": True, "show_log": True,
                 "voice": "Puck", "provider": "gemini"}
     try:
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.plugins import _plugin_settings_entry
-        entry = _plugin_settings_entry(load_config_readonly() or {}, _PLUGIN_NAME) or {}
-        st = entry.get("settings") or {}
+        st = _settings_node()
     except Exception:  # noqa: BLE001
         st = {}
     primary = st.get("primary_language")
@@ -525,13 +570,7 @@ _SETTINGS_SPEC = {
 
 
 def _stored_settings() -> dict:
-    try:
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.plugins import _plugin_settings_entry
-        entry = _plugin_settings_entry(load_config_readonly() or {}, _PLUGIN_NAME) or {}
-        st = entry.get("settings") or {}
-    except Exception:  # noqa: BLE001
-        st = {}
+    st = _settings_node()
     return {k: st.get(k, spec["default"]) for k, spec in _SETTINGS_SPEC.items()}
 
 
@@ -556,27 +595,29 @@ async def settings_post(body: dict | None = None) -> dict:
     values = (body or {}).get("values") or {}
     if not isinstance(values, dict):
         return {"ok": False, "error": "values must be an object"}
-    from hermes_cli.plugins_state import save_plugin_setting
-    try:
-        for key, value in values.items():
-            spec = _SETTINGS_SPEC.get(key)
-            if spec is None:
-                return {"ok": False, "error": f"unknown setting {key!r}"}
-            if spec["type"] == "bool":
-                if not isinstance(value, bool):
-                    return {"ok": False, "error": f"{key} must be a boolean"}
-            elif spec["type"] == "enum" and value not in (spec.get("choices") or []):
-                if key == "elevenlabs_voice":          # live account list, else any id
-                    known = [v["id"] for v in _eleven_voices()]
-                    if known and value not in known:
-                        return {"ok": False, "error": "unknown ElevenLabs voice id"}
-                else:
-                    return {"ok": False, "error": f"{key} must be one of the declared choices"}
-            save_plugin_setting(_PLUGIN_NAME, (key,), value)
-    except PermissionError as e:
-        return {"ok": False, "error": str(e)}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"save failed: {e}"}
+    clean: dict = {}
+    for key, value in values.items():
+        spec = _SETTINGS_SPEC.get(key)
+        if spec is None:
+            return {"ok": False, "error": f"unknown setting {key!r}"}
+        if spec["type"] == "bool":
+            if not isinstance(value, bool):
+                return {"ok": False, "error": f"{key} must be a boolean"}
+        elif spec["type"] == "enum" and value not in (spec.get("choices") or []):
+            if key == "elevenlabs_voice":          # live account list, else any id
+                known = [v["id"] for v in _eleven_voices()]
+                if known and value not in known:
+                    return {"ok": False, "error": "unknown ElevenLabs voice id"}
+            else:
+                return {"ok": False, "error": f"{key} must be one of the declared choices"}
+        clean[key] = value
+    if clean:
+        try:
+            _save_settings(clean)               # public config writer, one atomic pass
+        except PermissionError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"save failed: {e}"}
     return {"ok": True, "values": _stored_settings()}
 
 
@@ -605,106 +646,46 @@ def _plugin_home() -> str:
     return os.path.normpath(os.path.join(here, os.pardir, os.pardir, os.pardir))
 
 
-def _env_files() -> list[str]:
-    """``.env`` files to consult, in order: ``$HERMES_HOME``, this plugin's own home,
-    then ``~/.hermes``.
+def _secret_value(name: str) -> str:
+    """Resolve through Hermes' documented secret scope (``agent.secret_scope``).
 
-    Deduplicated on the *resolved* path, so a symlinked layout reads each file once,
-    while the path returned stays the one computed here.
-    """
-    roots = (os.environ.get("HERMES_HOME"), _plugin_home(), os.path.expanduser("~/.hermes"))
-    seen: set[str] = set()
-    files: list[str] = []
-    for root in roots:
-        if not root:
-            continue
-        path = os.path.join(root, ".env")
-        key = os.path.realpath(path)      # dedupe only — never rewrites the lookup path
-        if key not in seen:
-            seen.add(key)
-            files.append(path)
-    return files
-
-
-_dotenv_cache: dict[str, tuple[float, dict[str, str]]] = {}
-
-
-def _read_dotenv(path: str) -> dict[str, str]:
-    """Minimal ``.env`` reader: one ``KEY=VALUE`` per line, ``#`` comments, optional
-    ``export`` prefix and quotes.
-
-    Cached per path as ``(mtime, values)``: a ``/start`` asks for three keys, and an
-    edited file is picked up without a restart.
+    Profile-aware: under multiplexing it returns the active profile's value and fails
+    closed instead of another profile's, and it covers every configured secret source
+    (env, profile ``.env``, a key written by the dashboard's Providers page). Catalog
+    rule 11: read credentials through this, not by parsing ``.env`` yourself.
     """
     try:
-        mtime = os.stat(path).st_mtime
-    except OSError:
-        _dotenv_cache.pop(path, None)
-        return {}
-    cached = _dotenv_cache.get(path)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-
-    values: dict[str, str] = {}
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                if key.startswith("export "):
-                    key = key[7:].strip()
-                values[key] = _dotenv_value(value)
-    except OSError:
-        return {}
-    _dotenv_cache[path] = (mtime, values)
-    return values
-
-
-def _dotenv_value(raw: str) -> str:
-    """Value side of a ``KEY=VALUE`` line.
-
-    A quoted value keeps everything up to its closing quote (so ``KEY="a # b"`` survives);
-    an unquoted one loses a trailing `` # comment`` (so ``KEY=x  # old key`` is not
-    handed to the provider as a key).
-    """
-    value = raw.strip()
-    if value[:1] in ('"', "'"):
-        quote = value[0]
-        end = value.find(quote, 1)
-        return value[1:end] if end > 0 else value[1:]
-    if " #" in value:
-        value = value.split(" #", 1)[0].strip()
-    return value
+        from agent.secret_scope import get_secret
+        value = get_secret(name)
+    except Exception:  # noqa: BLE001 — older Hermes, or multiplex active (fail closed)
+        return ""
+    value = (value or "").strip() if isinstance(value, str) else ""
+    return "" if value.startswith("op://") else value
 
 
 def _env_value(name: str) -> str:
-    """Process env first, then the Hermes ``.env`` files.
+    """Resolve a credential through Hermes' secret scope — the only supported path.
 
-    The environment alone is not enough: Hermes loads only the *launch* home's ``.env``
-    into ``os.environ``, while a named profile's ``.env``
-    (``~/.hermes/profiles/<name>/.env``) deliberately stays out of it — and that is
-    exactly where Hermes' Providers page writes the key.
-
-    An unresolved ``op://`` reference (1Password secret source) counts as unset rather
-    than being handed to the provider as a key.
+    The host installs the scope per ``/api/plugins/<name>/`` request
+    (``_plugin_route_secret_scope`` in ``web_server_dashboard``), so ``get_secret``
+    already carries the routed profile's ``.env`` plus its external secret sources and
+    fails closed under multiplexing instead of borrowing another profile's key.
+    Catalog rule 11: credentials are read here, never by parsing ``.env`` ourselves.
     """
-    value = (os.environ.get(name) or "").strip()
-    if value and not value.startswith("op://"):
+    value = _secret_value(name)
+    if value:
         return value
-    for path in _env_files():
-        value = (_read_dotenv(path).get(name) or "").strip()
-        if value and not value.startswith("op://"):
-            return value
-    return ""
+    # No scope bound (a test harness or an older host): get_secret itself falls through
+    # to os.environ, so this second read only covers a host that predates the scope.
+    value = (os.environ.get(name) or "").strip()
+    return "" if value.startswith("op://") else value
 
 
 def _missing_key_error(*names: str) -> str:
-    """Point at every file actually consulted instead of naming one hardcoded path."""
-    return (f"{' or '.join(names)} not set (looked in the environment and in: "
-            + ", ".join(_env_files()) + ")")
+    """Path-free guidance: name the missing key and where the user fixes it."""
+    keys = " or ".join(names)
+    return (f"{keys} is not set — add it in Hermes Settings → Providers "
+            f"(or your Hermes .env), then press Start again.")
 
 
 def _eleven_key() -> str:
@@ -1285,6 +1266,27 @@ async def poll(in_offset: int = 0, out_offset: int = 0, a_offset: int = 0, d_off
     }
 
 
+def _claim_tool_call(call_id: str) -> str:
+    """``'pending'`` when the id belongs to an unanswered queued talk/recall call.
+
+    The module-global queues are the only record of what the provider actually asked
+    for, so membership here is what binds an answer to a real call (an arbitrary id
+    must not become speech).
+    """
+    for bucket in ("delegations", "recalls"):
+        for entry in _state.get(bucket) or []:
+            if str(entry.get("id") or "") == call_id:
+                return "answered" if entry.get("answered") else "pending"
+    return "unknown"
+
+
+def _mark_answered(call_id: str) -> None:
+    for bucket in ("delegations", "recalls"):
+        for entry in _state.get(bucket) or []:
+            if str(entry.get("id") or "") == call_id:
+                entry["answered"] = True
+
+
 @router.post("/tool_response")
 async def tool_response(body: dict) -> dict:
     """Renderer answers an talk delegation with the agent's reply.
@@ -1300,6 +1302,11 @@ async def tool_response(body: dict) -> dict:
     answer = str(body.get("answer", ""))[:8000]
     if not call_id:
         return {"ok": False, "error": "missing tool call id"}
+    state = _claim_tool_call(call_id)
+    if state == "unknown":
+        return {"ok": False, "error": "unknown tool call id"}
+    if state == "answered":
+        return {"ok": False, "error": "tool call already answered"}
     _state["tool_in_flight"] = None
     try:
         if _state.get("provider") in ("elevenlabs", "grok"):
@@ -1316,6 +1323,7 @@ async def tool_response(body: dict) -> dict:
             # back-to-back gets dropped (verified: no speech without the gap).
             await asyncio.sleep(0.4)
             await ws.send(json.dumps({"type": "response.create"}))
+            _mark_answered(call_id)
             return {"ok": True}
         response: dict = {"output": answer or "The agent returned no answer."}
         await ws.send(json.dumps({
@@ -1326,6 +1334,7 @@ async def tool_response(body: dict) -> dict:
                 }],
             }
         }))
+        _mark_answered(call_id)
         return {"ok": True}
     except Exception as exc:  # noqa: BLE001
         _state["error"] = f"tool_response send failed: {exc}"[:160]
@@ -1359,6 +1368,15 @@ async def close() -> dict:
     return {"ok": True}
 
 
+_KEY_ENV = {"gemini": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+            "elevenlabs": ("ELEVENLABS_API_KEY",),
+            "grok": ("XAI_API_KEY",)}
+
+
 @router.get("/status")
 async def status() -> dict:
-    return {"session": _state["session"] or "idle", "model": _state["model"], "api_key_configured": bool(_api_key())}
+    provider = _load_settings()["provider"]
+    names = _KEY_ENV.get(provider, _KEY_ENV["gemini"])
+    return {"session": _state["session"] or "idle", "model": _state["model"],
+            "provider": provider, "api_key_env": names[0],
+            "api_key_configured": any(bool(_env_value(n)) for n in names)}

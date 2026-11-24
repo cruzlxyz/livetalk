@@ -8,8 +8,10 @@ author: cruzlxyz
 license: MIT
 homepage: https://github.com/cruzlxyz/livetalk
 capabilities: []
-requires_hermes: ">=0.22.0"
+requires_hermes: ">=0.23.0"
 requires_env:
   - GOOGLE_API_KEY
+  - ELEVENLABS_API_KEY
+  - XAI_API_KEY
 python_dependencies:
   - websockets>=11.0,<16.0
