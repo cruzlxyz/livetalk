@@ -686,9 +686,10 @@ function createLive(ctx) {
     // Single source of truth: write through the OFFICIAL plugin-settings writer
     // (the same store the Settings → Plugins form saves) — picker and form can
     // never disagree. The poll loop echoes the saved value back for display.
+    // ONE writer: the plugin's own /settings endpoint (same store the Settings page
+    // uses). Writing through plugins.manage here gave the model a second writer.
     try {
-      void host.request('plugins.manage', { action: 'settings', key: 'livetalk',
-        values: { live_model: bare } }).catch(() => {})
+      void ctx.rest('/settings', { method: 'POST', body: { values: { live_model: bare } } }).catch(() => {})
     } catch {}
   }
 

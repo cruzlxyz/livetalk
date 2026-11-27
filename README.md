@@ -68,7 +68,7 @@ ELEVENLABS_API_KEY=sk_...
 XAI_API_KEY=xai-...
 ```
 
-The backend resolves keys through Hermes' credential store, which the host scopes per plugin request — so a named profile's key is the one that resolves, and the plugin never parses `.env` itself. Only the key of the provider you select is required; a `/start` failure names the missing variable and points at the Providers page.
+The backend resolves keys through Hermes' credential store, which the host scopes per plugin request — so a named profile's key is the one that resolves, and the plugin never parses `.env` itself. If several profiles share one process and no profile is bound to the request, resolution fails closed with an error instead of borrowing the launch profile's key. Only the key of the provider you select is required; a `/start` failure names the missing variable and points at the Providers page.
 
 Then click the blob in the status bar and just talk.
 

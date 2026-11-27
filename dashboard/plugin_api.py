@@ -647,38 +647,25 @@ def _plugin_home() -> str:
 
 
 def _secret_value(name: str) -> str:
-    """Resolve through Hermes' documented secret scope (``agent.secret_scope``).
+    """Resolve a credential through Hermes' secret scope — ``agent.secret_scope``.
 
-    Profile-aware: under multiplexing it returns the active profile's value and fails
-    closed instead of another profile's, and it covers every configured secret source
-    (env, profile ``.env``, a key written by the dashboard's Providers page). Catalog
-    rule 11: read credentials through this, not by parsing ``.env`` yourself.
+    The host installs the scope per ``/api/plugins/<name>/`` request
+    (``_plugin_route_secret_scope``), so this is already the routed profile's view and
+    covers every configured secret source; with a single profile running ``get_secret``
+    reads ``os.environ`` itself. Under multiplexing with no profile bound it raises
+    ``UnscopedSecretError``, and that MUST propagate: swallowing it and falling back to
+    ``os.environ`` would hand the launch profile's key to another profile's session.
+    Catalog rule 11: credentials are read here, never by parsing ``.env`` ourselves.
     """
-    try:
-        from agent.secret_scope import get_secret
-        value = get_secret(name)
-    except Exception:  # noqa: BLE001 — older Hermes, or multiplex active (fail closed)
-        return ""
+    from agent.secret_scope import get_secret
+    value = get_secret(name)
     value = (value or "").strip() if isinstance(value, str) else ""
     return "" if value.startswith("op://") else value
 
 
 def _env_value(name: str) -> str:
-    """Resolve a credential through Hermes' secret scope — the only supported path.
-
-    The host installs the scope per ``/api/plugins/<name>/`` request
-    (``_plugin_route_secret_scope`` in ``web_server_dashboard``), so ``get_secret``
-    already carries the routed profile's ``.env`` plus its external secret sources and
-    fails closed under multiplexing instead of borrowing another profile's key.
-    Catalog rule 11: credentials are read here, never by parsing ``.env`` ourselves.
-    """
-    value = _secret_value(name)
-    if value:
-        return value
-    # No scope bound (a test harness or an older host): get_secret itself falls through
-    # to os.environ, so this second read only covers a host that predates the scope.
-    value = (os.environ.get(name) or "").strip()
-    return "" if value.startswith("op://") else value
+    """One credential source: the scope above. No local fallback, by design."""
+    return _secret_value(name)
 
 
 def _missing_key_error(*names: str) -> str:
